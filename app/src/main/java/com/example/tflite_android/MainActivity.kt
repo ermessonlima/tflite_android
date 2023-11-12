@@ -1,6 +1,7 @@
 package com.example.tflite_android
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -9,12 +10,20 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
+import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Surface
+import android.view.TextureView
 import android.widget.Button
 import android.widget.ImageView
+import androidx.core.content.ContextCompat
 import com.example.tflite_android.ml.Android
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.image.ImageProcessor
@@ -22,7 +31,7 @@ import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
 import java.io.IOException
 import java.lang.Exception
-
+import android.os.Handler
 class MainActivity : AppCompatActivity() {
 
     val REQUEST_IMAGE_CAPTURE  = 1
@@ -32,7 +41,12 @@ class MainActivity : AppCompatActivity() {
     lateinit var imageView: ImageView
     lateinit var  buttonSelectImage:  Button
     lateinit var  buttonStart: Button
+    lateinit var buttonCapture: Button
     lateinit var labels:List<String>
+    lateinit var cameraManager: CameraManager
+    lateinit var cameraDevice: CameraDevice
+    lateinit var textureView: TextureView
+    lateinit var handler: Handler
 
     val paint = Paint()
     var colors = listOf<Int>(
@@ -44,9 +58,34 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         get_permissions()
 
+
+
+
+        textureView = findViewById(R.id.textureView)
+
+        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                open_camera()
+            }
+            override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {}
+            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture) = true
+            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+                val bitmap = textureView.bitmap ?: return  // Valida se o bitmap não é nulo
+                processFrame(bitmap)
+            }
+        }
+
+
+        val handlerThread = HandlerThread("videoThread")
+        handlerThread.start()
+        handler = Handler(handlerThread.looper)
+
         labels = FileUtil.loadLabels(this, "labels.txt")
         buttonSelectImage = findViewById(R.id.button_select_image)
         buttonStart = findViewById(R.id.button_start)
+        buttonCapture = findViewById(R.id.buttonCapture)
+
+
         buttonSelectImage.setOnClickListener {
             Log.d("TFLite-ODT", "Detected object:  ")
             dispatchTakePictureIntent()
@@ -56,6 +95,16 @@ class MainActivity : AppCompatActivity() {
             Log.d("TFLite-ODT", "Detected object:  ")
             dispatchPickPictureIntent()
         }
+
+        buttonCapture.setOnClickListener {
+            Log.d("capture", "capturee")
+            open_camera()
+        }
+
+
+
+
+
         imageView = findViewById(R.id.imageView)
 
         val imageBitmap = getBitmapFromAsset("teste.jpg")
@@ -72,7 +121,38 @@ class MainActivity : AppCompatActivity() {
             Log.e("Erro ao carregar modelo","=>", e)
         }
 
+        cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    }
 
+    @SuppressLint("MissingPermission")
+    fun open_camera(){
+        cameraManager.openCamera(cameraManager.cameraIdList[0], object:CameraDevice.StateCallback(){
+            override fun onOpened(p0: CameraDevice) {
+                cameraDevice = p0
+
+                var surfaceTexture = textureView.surfaceTexture
+                var surface = Surface(surfaceTexture)
+
+                var captureRequest = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                captureRequest.addTarget(surface)
+
+                cameraDevice.createCaptureSession(listOf(surface), object: CameraCaptureSession.StateCallback(){
+                    override fun onConfigured(p0: CameraCaptureSession) {
+                        p0.setRepeatingRequest(captureRequest.build(), null, null)
+                    }
+                    override fun onConfigureFailed(p0: CameraCaptureSession) {
+                    }
+                }, handler)
+            }
+
+            override fun onDisconnected(p0: CameraDevice) {
+
+            }
+
+            override fun onError(p0: CameraDevice, p1: Int) {
+
+            }
+        }, handler)
     }
 
 
@@ -122,10 +202,21 @@ class MainActivity : AppCompatActivity() {
             requestPermissions(arrayOf(android.Manifest.permission.CAMERA), 101)
         }
     }
+
+    fun get_permission(){
+        if(ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED){
+            requestPermissions(arrayOf(android.Manifest.permission.CAMERA), 101)
+        }
+    }
     override fun onRequestPermissionsResult(  requestCode: Int, permissions: Array<out String>, grantResults: IntArray  ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if(grantResults[0] != PackageManager.PERMISSION_GRANTED) get_permissions()
+        if(grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+            get_permission()
+            get_permissions()
+
+        }
     }
+
 
     private fun runObjectDetection(bitmap: Bitmap) {
 
@@ -158,6 +249,37 @@ class MainActivity : AppCompatActivity() {
 
     }
 
+    fun processFrame(bitmap: Bitmap) {
+        val tensorImage = TensorImage.fromBitmap(bitmap)
+        val processedImage = imageProcessor.process(tensorImage)
+        val outputs = model.process(processedImage)
+        val locations = outputs.locationAsTensorBuffer.floatArray
+        val classes = outputs.categoryAsTensorBuffer.floatArray
+        val scores = outputs.scoreAsTensorBuffer.floatArray
+        var mutable = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(mutable)
+
+        val h = mutable.height
+        val w = mutable.width
+        paint.textSize = h/15f
+        paint.strokeWidth = h/85f
+        var x = 0
+        scores.forEachIndexed { index, fl ->
+            x = index
+            x *= 4
+            if(fl > 0.5){
+                paint.setColor(colors.get(index))
+                paint.style = Paint.Style.STROKE
+                canvas.drawRect(RectF(locations.get(x+1)*w, locations.get(x)*h, locations.get(x+3)*w, locations.get(x+2)*h), paint)
+                paint.style = Paint.Style.FILL
+                canvas.drawText(labels.get(classes.get(index).toInt())+" "+fl.toString(), locations.get(x+1)*w, locations.get(x)*h, paint)
+            }
+        }
+
+
+        imageView.setImageBitmap(mutable)
+    }
+
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -182,4 +304,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+
+
+
+
 }
